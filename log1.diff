@@ -1,0 +1,249 @@
+// this diff got printf working
+
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 4fc4125..cc68c20 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -250,6 +250,7 @@ jobs:
+             -DCMAKE_INSTALL_PREFIX=$PREFIX                    \
+             -DXEUS_CPP_EMSCRIPTEN_WASM_BUILD=ON               \
+             -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ON            \
++            -DCMAKE_VERBOSE_MAKEFILE=ON                       \
+             ..
+           EMCC_CFLAGS='-sERROR_ON_UNDEFINED_SYMBOLS=0' emmake make -j  ${{ env.ncpus }} install
+ 
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3d881c8..9fcfc22 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -108,16 +108,19 @@ endif()
+ 
+ find_package(argparse REQUIRED)
+ find_package(pugixml REQUIRED)
++find_package(LLVM REQUIRED)
++find_package(LLD REQUIRED)
++find_package(Clang REQUIRED)
+ 
+ # Configuration
+ # =============
+ 
+-if (CPPINTEROP_LLVM_VERSION_MAJOR VERSION_GREATER ${CMAKE_CXX_COMPILER_VERSION})
+-    message(WARNING "The resource directory being used corresponds to clang version ${CMAKE_CXX_COMPILER_VERSION}. \
+-        It should be updated to match clang version ${CPPINTEROP_LLVM_VERSION_MAJOR} once cppinterop \
+-        can provide a compatible resource directory.")
+-endif()
+-string(REGEX MATCH "^([0-9]+)" CXX_MAJOR_VERSION ${CMAKE_CXX_COMPILER_VERSION})
++# if (CPPINTEROP_LLVM_VERSION_MAJOR VERSION_GREATER ${CMAKE_CXX_COMPILER_VERSION})
++#     message(WARNING "The resource directory being used corresponds to clang version ${CMAKE_CXX_COMPILER_VERSION}. \
++#         It should be updated to match clang version ${CPPINTEROP_LLVM_VERSION_MAJOR} once cppinterop \
++#         can provide a compatible resource directory.")
++# endif()
++# string(REGEX MATCH "^([0-9]+)" CXX_MAJOR_VERSION ${CMAKE_CXX_COMPILER_VERSION})
+ 
+ if (NOT DEFINED XEUS_CPP_KERNELSPEC_PATH)
+     set(XEUS_CPP_KERNELSPEC_PATH "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/")
+@@ -126,7 +129,8 @@ endif ()
+ function(configure_kernel kernel)
+   set(XEUS_CPP_PATH "$ENV{PATH}")
+   set(XEUS_CPP_LD_LIBRARY_PATH "$ENV{LD_LIBRARY_PATH}")
+-  set(XEUS_CPP_RESOURCE_DIR ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/clang/${CXX_MAJOR_VERSION})
++  set(XEUS_CPP_RESOURCE_DIR ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/clang/${CPPINTEROP_LLVM_VERSION_MAJOR})
++  add_compile_definitions(XEUS_CPP_RESOURCE_DIR="${XEUS_CPP_RESOURCE_DIR}")
+   set(XEUS_CPP_INCLUDE_DIR ${CMAKE_INSTALL_PREFIX}/include)
+ 
+   if (WIN32)
+@@ -261,6 +265,7 @@ endmacro()
+ 
+ # Common macro kernels (xcpp)
+ macro(xeus_cpp_set_kernel_options target_name)
++    #target_link_options(${target_name} PUBLIC "-Wl,--export=__clang_Interpreter_SetValueNoAlloc")
+     if (XEUS_CPP_USE_SHARED_XEUS_CPP)
+         target_link_libraries(${target_name} PRIVATE xeus-cpp)
+         if(CMAKE_DL_LIBS)
+@@ -339,7 +344,8 @@ macro(xeus_cpp_create_target target_name linkage output_name)
+         # Curl initialised specifically for xassist
+         target_link_libraries(${target_name} PUBLIC ${XEUS_CPP_XEUS_TARGET} clangCppInterOp pugixml argparse::argparse curl)
+     else ()
+-        target_link_libraries(${target_name} PUBLIC ${XEUS_CPP_XEUS_TARGET} clangCppInterOp pugixml argparse::argparse)
++        target_link_libraries(${target_name} PUBLIC ${XEUS_CPP_XEUS_TARGET} clangCppInterOp pugixml argparse::argparse clangInterpreter)
++        #target_link_libraries(${target_name} PUBLIC ${XEUS_CPP_XEUS_TARGET} clangCppInterOp pugixml argparse::argparse)
+     endif()
+     
+     if (WIN32 OR CYGWIN)
+@@ -400,6 +406,46 @@ if (XEUS_CPP_BUILD_EXECUTABLE)
+     target_link_libraries(xcpp PRIVATE xeus-zmq)
+ endif()
+ 
++function(xeus_wasm_compile_options_local target)
++    target_compile_options("${target}"
++        PUBLIC --std=c++17
++        PUBLIC -Wno-deprecated
++        PUBLIC "SHELL: -fexceptions"
++        PUBLIC "SHELL: -g"  # Add debug symbols
++        PUBLIC "SHELL: -fsanitize=address"  # Address sanitizer
++        PUBLIC "SHELL: -s SAFE_HEAP"  # Safe heap option
++    )
++    set_property(TARGET ${target} PROPERTY POSITION_INDEPENDENT_CODE ON)
++endfunction()
++
++function(xeus_wasm_link_options_local target environment)
++    target_link_options("${target}"
++        PUBLIC --bind
++        PUBLIC -Wno-unused-command-line-argument
++        PUBLIC "SHELL: -fexceptions"
++        # PUBLIC "SHELL: -00"
++        # PUBLIC "SHELL: -g"  # Add debug symbols
++        # PUBLIC "SHELL: -fsanitize=address"
++        PUBLIC "SHELL: -s MODULARIZE=1"
++        PUBLIC "SHELL: -s EXPORT_NAME=\"createXeusModule\""
++        PUBLIC "SHELL: -s EXPORT_ES6=0"
++        PUBLIC "SHELL: -s USE_ES6_IMPORT_META=0"
++        PUBLIC "SHELL: -s DEMANGLE_SUPPORT=0"
++        PUBLIC "SHELL: -s ASSERTIONS=2"
++        PUBLIC "SHELL: -s ALLOW_MEMORY_GROWTH=1"
++        PUBLIC "SHELL: -s EXIT_RUNTIME=1"
++        PUBLIC "SHELL: -s WASM=1"
++        PUBLIC "SHELL: -s USE_PTHREADS=0"
++        PUBLIC "SHELL: -s STACK_SIZE=64mb"  # Updated here
++        PUBLIC "SHELL: -s INITIAL_MEMORY=256mb"
++        PUBLIC "SHELL: -s WASM_BIGINT"
++        PUBLIC "SHELL: -s FORCE_FILESYSTEM"
++        PUBLIC "SHELL: -s MAIN_MODULE=1"
++        # PUBLIC "SHELL: -Wl,--export=__clang_Interpreter_SetValueNoAlloc"
++        #PUBLIC "SHELL: --preload-file /Users/anutosh491/micromamba/envs/xeus-cpp-wasm-build/lib/python3.13/site-packages/emsdk/upstream/emscripten/cache/sysroot/@/"
++    )
++endfunction()
++
+ if(EMSCRIPTEN)
+     include(WasmBuildOptions)
+     find_package(xeus-lite REQUIRED)
+@@ -407,7 +453,7 @@ if(EMSCRIPTEN)
+     target_link_libraries(xcpp PRIVATE xeus-lite)
+     xeus_cpp_set_kernel_options(xcpp)
+     xeus_wasm_compile_options(xcpp)
+-    xeus_wasm_link_options(xcpp "web,worker")
++    xeus_wasm_link_options_local(xcpp "web,worker")
+ endif()
+ 
+ # Tests
+@@ -504,4 +550,4 @@ endif ()
+ 
+ if(XEUS_CPP_INCLUDE_DOCS)
+     add_subdirectory(docs)
+-endif()
++endif()
+\ No newline at end of file
+diff --git a/environment-wasm-build.yml b/environment-wasm-build.yml
+index 130ba90..50ab622 100644
+--- a/environment-wasm-build.yml
++++ b/environment-wasm-build.yml
+@@ -1,4 +1,4 @@
+-name: xeus-cpp-wasm-build
++name: xeus-cpp-wasm-build-duplicate
+ channels:
+   - conda-forge
+ dependencies:
+diff --git a/environment-wasm-host.yml b/environment-wasm-host.yml
+index 152df9e..a1da8d9 100644
+--- a/environment-wasm-host.yml
++++ b/environment-wasm-host.yml
+@@ -1,4 +1,4 @@
+-name: xeus-cpp-wasm-host
++name: xeus-cpp-wasm-host-duplicate
+ channels:
+   - https://repo.mamba.pm/emscripten-forge
+   - https://repo.mamba.pm/conda-forge
+@@ -6,6 +6,7 @@ dependencies:
+   - nlohmann_json
+   - xeus-lite
+   - xeus
+-  - CppInterOp>=1.4.0
++  - CppInterOp
+   - cpp-argparse
+-  - pugixml
+\ No newline at end of file
++  - pugixml
++  - llvm
+\ No newline at end of file
+diff --git a/src/main.cpp b/src/main.cpp
+index 7896b2e..53f140e 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -59,6 +59,7 @@ int main(int argc, char* argv[])
+     signal(SIGINT, xcpp::stop_handler);
+ 
+     std::string file_name = xcpp::extract_filename(argc, argv);
++    std::cout << "file_name " << file_name << std::endl;
+ 
+     interpreter_ptr interpreter = xcpp::build_interpreter(argc, argv);
+ 
+diff --git a/src/xinterpreter.cpp b/src/xinterpreter.cpp
+index 2a8084f..b2a2003 100644
+--- a/src/xinterpreter.cpp
++++ b/src/xinterpreter.cpp
+@@ -37,9 +37,11 @@ using Args = std::vector<const char*>;
+ 
+ void* createInterpreter(const Args &ExtraArgs = {}) {
+   Args ClangArgs = {/*"-xc++"*/"-v"}; // ? {"-Xclang", "-emit-llvm-only", "-Xclang", "-diagnostic-log-file", "-Xclang", "-", "-xc++"};
++#ifndef EMSCRIPTEN
+   if (std::find_if(ExtraArgs.begin(), ExtraArgs.end(), [](const std::string& s) {
+     return s == "-resource-dir";}) == ExtraArgs.end()) {
+-    std::string resource_dir = Cpp::DetectResourceDir();
++    std::string resource_dir = Cpp::DetectResourceDir("clang");
++    std::cout << "resource dir" << resource_dir << std::endl;
+     if (resource_dir.empty())
+       std::cerr << "Failed to detect the resource-dir\n";
+     ClangArgs.push_back("-resource-dir");
+@@ -51,6 +53,7 @@ void* createInterpreter(const Args &ExtraArgs = {}) {
+     ClangArgs.push_back("-isystem");
+     ClangArgs.push_back(CxxInclude.c_str());
+   }
++#endif
+   ClangArgs.insert(ClangArgs.end(), ExtraArgs.begin(), ExtraArgs.end());
+   // FIXME: We should process the kernel input options and conditionally pass
+   // the gpu args here.
+@@ -83,24 +86,8 @@ namespace xcpp
+     {
+         // We need to find what's the C++ version the interpreter runs with.
+         const char* code = R"(
+-int __get_cxx_version () {
+-#if __cplusplus > 202302L
+-    return 26;
+-#elif __cplusplus > 202002L
+-    return 23;
+-#elif __cplusplus >  201703L
+-    return 20;
+-#elif __cplusplus > 201402L
+-    return 17;
+-#elif __cplusplus > 201103L || (defined(_WIN32) && _MSC_VER >= 1900)
+-    return 14;
+-#elif __cplusplus >= 201103L
+-   return 11;
+-#else
+-  return 0;
+-#endif
+-  }
+-__get_cxx_version ()
++extern "C" int printf(const char*,...);
++auto r1 = printf("r=%d\n", 1+1);
+       )";
+ 
+         auto cxx_version = Cpp::Evaluate(code);
+@@ -117,7 +104,7 @@ __get_cxx_version ()
+     {
+         //NOLINTNEXTLINE (cppcoreguidelines-pro-bounds-pointer-arithmetic)
+         createInterpreter(Args(argv ? argv + 1 : argv, argv + argc));
+-        m_version = get_stdopt();
++        //m_version = get_stdopt();
+         redirect_output();
+         init_includes();
+         init_preamble();
+@@ -322,7 +309,7 @@ __get_cxx_version ()
+                              "  xeus-cpp: a C++ Jupyter kernel - based on Clang-repl\n";
+         result["banner"] = banner;
+         result["language_info"]["name"] = "C++";
+-        result["language_info"]["version"] = m_version;
++        result["language_info"]["version"] = "20";
+         result["language_info"]["mimetype"] = "text/x-c++src";
+         result["language_info"]["codemirror_mode"] = "text/x-c++src";
+         result["language_info"]["file_extension"] = ".cpp";
