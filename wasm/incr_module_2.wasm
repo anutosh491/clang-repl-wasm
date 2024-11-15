@@ -1,0 +1,57 @@
+(module $incr_module_2.wasm
+  (memory $env.memory (;0;) (import "env" "memory") 1)
+  (table $env.__indirect_function_table (;0;) (import "env" "__indirect_function_table") 0 funcref)
+  (global $__stack_pointer (;0;) (import "env" "__stack_pointer") (mut i32))
+  (global $__memory_base (;1;) (import "env" "__memory_base") i32)
+  (global $__table_base (;2;) (import "env" "__table_base") i32)
+  (func $printf (;0;) (import "env" "printf") (param i32 i32) (result i32))
+  (global $result (;3;) (export "result") i32 (i32.const 8))
+  (global $__dso_handle (;4;) (export "__dso_handle") i32 (i32.const 0))
+  (func $__wasm_call_ctors (;1;)
+  )
+  (func $__wasm_apply_data_relocs (;2;)
+  )
+  (func $__wasm_call_ctors (;3;) (export "__wasm_call_ctors")
+    call $_GLOBAL__sub_I_incr_module_2
+  )
+  (func $__wasm_apply_data_relocs (;4;) (export "__wasm_apply_data_relocs")
+  )
+  (func $__cxx_global_var_init (;5;)
+    global.get $__memory_base
+    i32.const 8
+    i32.add
+    i32.const 42
+    i32.store
+  )
+  (func $__stmts__1 (;6;)
+    (local $var0 i32)
+    (local $var1 i32)
+    global.get $__stack_pointer
+    i32.const 16
+    i32.sub
+    local.tee $var0
+    global.set $__stack_pointer
+    local.get $var0
+    global.get $__memory_base
+    local.tee $var1
+    i32.const 8
+    i32.add
+    i32.load
+    i32.store
+    local.get $var1
+    i32.const 0
+    i32.add
+    local.get $var0
+    call $printf
+    drop
+    local.get $var0
+    i32.const 16
+    i32.add
+    global.set $__stack_pointer
+  )
+  (func $_GLOBAL__sub_I_incr_module_2 (;7;)
+    call $__cxx_global_var_init
+    call $__stmts__1
+  )
+  (data (global.get $__memory_base) "r=%d\0a\00\00\00\00\00\00\00")
+)
