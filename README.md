@@ -25,6 +25,8 @@ To achieve this use the following
 micromamba create -n wasm-host
 micromamba activate wasm-host
 micromamba install llvm -c https://repo.mamba.pm/emscripten-forge
+// come back to wasm-build now
+micromamba deactivate
 ```
 
 # Building & Running the project
@@ -43,6 +45,10 @@ The `CMakeLists.txt`, `CompilerModule.cpp` and `index.html` are present as sourc
 ```
 cd build
 
+// export wasm-host as the PREFIX
+// we still need to use wasm-build for cmake
+export PREFIX=$MAMBA_ROOT_PREFIX/envs/wasm-host
+
 // sysroot is usually present $HOME/emsdk/upstream/emscripten/cache/sysroot
 export SYSROOT_PATH=/path/to/sysroot
 
@@ -56,7 +62,7 @@ emcmake cmake \
     ../
 ```
 
-3) We are now interested in install the `compiler.js`, `compiler.wasm` and `compiler.data` binaries. Done using 
+3) We are now interested in install the `Compiler.js`, `Compiler.wasm` and `Compiler.data` binaries. Done using 
 ```
 emmake make
 ```
