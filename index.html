@@ -1,4 +1,4 @@
-!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <title>WASM Clang test</title>
@@ -14,9 +14,19 @@
   <pre id="editor" contenteditable="true">#include &lt;SDL2/SDL.h&gt;
 
 // Initialize
-#include <iostream>
-using namespace std;
-cout << "Hello World" << endl;
+SDL_Init(SDL_INIT_VIDEO);
+SDL_Window *window;
+SDL_Renderer *renderer;
+SDL_CreateWindowAndRenderer(300, 300, 0, &amp;window, &amp;renderer);
+
+// Repeat this to update image
+SDL_SetRenderDrawColor(renderer, 0x00, 0x80, 0x00, 0xFF);
+SDL_Rect rect1 = {.x = 10, .y = 10, .w = 150, .h = 100};
+SDL_RenderFillRect(renderer, &amp;rect1);
+SDL_SetRenderDrawColor(renderer, 0x80, 0x80, 0x00, 0xFF);
+SDL_Rect rect2 = {.x = 20, .y = 20, .w = 100, .h = 50};
+SDL_RenderFillRect(renderer, &amp;rect2);
+SDL_RenderPresent(renderer);</pre>
   <canvas id="canvas"></canvas>
   <p id="status">Waiting for compiler to load... (~55 MiB)</p>
   <button id="run">RUN</button>
