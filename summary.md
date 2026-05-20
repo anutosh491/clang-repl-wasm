@@ -568,38 +568,235 @@ This is functionally identical to the `clang-repl-wasm` approach. ✅
 
 The `EmscriptenStdlib` build product (`emscriptenstdlib.py`) builds exactly this.
 
-### Phase 5 — Build Swift stdlib for wasm32
+### Why `emscriptensysroot.py` is NOT needed
+
+The sysroot (Emscripten's C/C++ libc, libc++, compiler-rt) already exists at:
+```
+/Users/anutosh491/work/emsdk/upstream/emscripten/cache/sysroot
+```
+`emscriptensysroot.py` runs `embuilder` to build those and copy them to a build-local path.
+Since the emsdk is already installed and active, there is nothing to build — the sysroot is
+already there. Pass `SWIFT_EMSCRIPTEN_SYSROOT_PATH` pointing directly to the emsdk cache
+sysroot in all cmake commands below.
+
+### Why Xcode's swiftc cannot cross-compile the stdlib
+
+The stdlib is written in Swift. Cross-compiling it to wasm32 requires a native `swiftc`
+binary (runs on macOS ARM64) that accepts `-target wasm32-unknown-emscripten`. Apple's
+released `swiftc` 6.3.2 does not support the `emscripten` OS environment — it lacks the
+patches in `lib/Basic/Platform.cpp` and `cmake/modules/SwiftConfigureSDK.cmake` that Max
+Desiatov added in `swiftlang/swift#87797`. We must build a native swiftc from
+`swift-dev/swift` (which IS Max's branch, rebased).
+
+That native swiftc also needs the **WebAssembly LLVM backend** compiled in, so it can
+actually emit wasm32 object files when cross-compiling stdlib sources. The existing
+`native_build` in `swift-dev/llvm-project/native_build/` was configured with
+`LLVM_TARGETS_TO_BUILD=host` (AArch64 only) — we need to reconfigure it to also include
+`WebAssembly`.
+
+### Phase 5a — Extend native LLVM build to include WebAssembly target
 
 ```bash
-# From swift-dev, using the existing build-script infrastructure:
-python3 swift/utils/build-script \
-  --build-emscriptenstdlib \
-  ... (other flags)
+cd /Users/anutosh491/work/swift-dev/llvm-project/native_build
+
+# Reconfigure: keep existing settings, add WebAssembly to target list
+cmake ../llvm \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=/usr/bin/clang \
+  -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+  -DLLVM_ENABLE_PROJECTS="clang" \
+  -DLLVM_TARGETS_TO_BUILD="AArch64;WebAssembly" \
+  -DLLVM_ENABLE_ZLIB=OFF \
+  -DLLVM_ENABLE_ZSTD=OFF \
+  -DLLVM_ENABLE_LIBXML2=OFF \
+  -DLLVM_INCLUDE_TESTS=OFF \
+  -DLLVM_INCLUDE_BENCHMARKS=OFF \
+  -DLLVM_INCLUDE_EXAMPLES=OFF \
+  -DLLVM_BUILD_TOOLS=ON \
+  -DLLVM_BUILD_UTILS=OFF \
+  -DCLANG_BUILD_TOOLS=OFF
+
+# Build everything (LLVM static libs + clang libs + llvm-ar/ranlib tools)
+# ~30-45 min on M-chip Mac
+make -j$(sysctl -n hw.logicalcpu)
 ```
 
-Or manually (mirrors what `emscriptenstdlib.py` does):
+Verify:
+```bash
+ls /Users/anutosh491/work/swift-dev/llvm-project/native_build/lib/libLLVMWebAssemblyCodeGen.a
+ls /Users/anutosh491/work/swift-dev/llvm-project/native_build/bin/llvm-ar
+```
+
+### Phase 5b — Build native swiftc from swift-dev/swift
+
+This is the swiftc binary that will cross-compile stdlib `.swift` sources to wasm32. It
+runs on macOS ARM64 but emits wasm32 object code (via the WebAssembly backend from Phase 5a).
+
+First, build cmark for the native (macOS) host:
+```bash
+mkdir -p /Users/anutosh491/work/swift-dev/cmark-native-build
+cd /Users/anutosh491/work/swift-dev/cmark-native-build
+
+cmake ../cmark \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=/usr/bin/clang \
+  -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+  -DCMARK_TESTS=OFF \
+  -DCMARK_SHARED=OFF \
+  -DCMARK_STATIC=ON
+
+make -j$(sysctl -n hw.logicalcpu)
+```
+
+Then configure and build `swift-frontend`:
+```bash
+mkdir -p /Users/anutosh491/work/swift-dev/swift-native-build
+cd /Users/anutosh491/work/swift-dev/swift-native-build
+
+cmake ../swift \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=/usr/bin/clang \
+  -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+  -DLLVM_DIR=/Users/anutosh491/work/swift-dev/llvm-project/native_build/lib/cmake/llvm \
+  -DClang_DIR=/Users/anutosh491/work/swift-dev/llvm-project/native_build/lib/cmake/clang \
+  -DSWIFT_PATH_TO_CMARK_SOURCE=/Users/anutosh491/work/swift-dev/cmark \
+  -DSWIFT_PATH_TO_CMARK_BUILD=/Users/anutosh491/work/swift-dev/cmark-native-build \
+  -DSWIFT_INCLUDE_TOOLS=TRUE \
+  -DSWIFT_ENABLE_SWIFT_IN_SWIFT=ON \
+  -DBOOTSTRAPPING_MODE=HOSTTOOLS \
+  -DSWIFT_NATIVE_SWIFT_TOOLS_PATH=/usr/bin \
+  -DSWIFT_INCLUDE_TESTS=OFF \
+  -DSWIFT_INCLUDE_DOCS=OFF \
+  -DSWIFT_BUILD_STATIC_STDLIB=OFF \
+  -DSWIFT_BUILD_DYNAMIC_STDLIB=OFF \
+  -DSWIFT_BUILD_SOURCEKIT=OFF \
+  -DSWIFT_BUILD_REMOTE_MIRROR=OFF \
+  -DSWIFT_TOOL_LIBSWIFTSCAN_BUILD=OFF \
+  -DSWIFT_SDKS=OSX \
+  -DSWIFT_PRIMARY_VARIANT_SDK=OSX \
+  -DSWIFT_PRIMARY_VARIANT_ARCH=arm64 \
+  -DSWIFT_EMSCRIPTEN_SYSROOT_PATH=/Users/anutosh491/work/emsdk/upstream/emscripten/cache/sysroot
+
+# Build only swift-frontend — ~30-45 min on M-chip Mac
+make -j$(sysctl -n hw.logicalcpu) swift-frontend
+```
+
+**What `BOOTSTRAPPING_MODE=HOSTTOOLS` + `SWIFT_NATIVE_SWIFT_TOOLS_PATH=/usr/bin` means:**
+The cmake uses Xcode's swiftc (`/usr/bin/swiftc`) to compile any Swift-written parts of the
+compiler itself (the "Swift-in-Swift" sources). Those sources are for macOS, so Xcode's
+swiftc works fine. The NATIVE swiftc we're building will contain Max's wasm32 C++ patches
+and the WebAssembly LLVM backend from Phase 5a — making it capable of cross-compiling to
+wasm32.
+
+Verify:
+```bash
+ls /Users/anutosh491/work/swift-dev/swift-native-build/bin/swift-frontend
+# cmake also creates a swiftc symlink:
+ls /Users/anutosh491/work/swift-dev/swift-native-build/bin/swiftc
+# If the symlink is missing, create it:
+# ln -sf swift-frontend /Users/anutosh491/work/swift-dev/swift-native-build/bin/swiftc
+```
+
+### Phase 5c — Build Swift stdlib for wasm32
+
+Uses the native swiftc from Phase 5b to cross-compile Swift source files to wasm32 objects.
+`emcmake` sets `CMAKE_C_COMPILER=emcc` / `CMAKE_CXX_COMPILER=em++` for the C/C++ runtime
+parts; the Swift sources are compiled by the native swiftc via `SWIFT_NATIVE_SWIFT_TOOLS_PATH`.
+
 ```bash
 mkdir -p /Users/anutosh491/work/swift-dev/swift-stdlib-wasm-build
 cd /Users/anutosh491/work/swift-dev/swift-stdlib-wasm-build
 
+source /Users/anutosh491/work/emsdk/emsdk_env.sh
+
+export EMSDK_SYSROOT=/Users/anutosh491/work/emsdk/upstream/emscripten/cache/sysroot
+export NATIVE_SWIFT_BIN=/Users/anutosh491/work/swift-dev/swift-native-build/bin
+export NATIVE_LLVM_BIN=/Users/anutosh491/work/swift-dev/llvm-project/native_build/bin
+export LLVM_WASM_CMAKE=/Users/anutosh491/work/swift-dev/llvm-wasm-build/lib/cmake/llvm
+export STRING_PROC_SRC=/Users/anutosh491/work/swift-dev/swift-experimental-string-processing
+
 emcmake cmake ../swift \
   -DCMAKE_BUILD_TYPE=Release \
-  ... (same triple/sdk flags as Phase 4) ...
+  -DCMAKE_INSTALL_PREFIX=/usr \
+  -DCMAKE_SYSTEM_NAME=Emscripten \
+  -DCMAKE_SYSTEM_PROCESSOR=wasm32 \
+  -DUNIX=TRUE \
+  -DCMAKE_C_COMPILER_WORKS=TRUE \
+  -DCMAKE_CXX_COMPILER_WORKS=TRUE \
+  -DCMAKE_Swift_COMPILER_WORKS=TRUE \
+  -DLLVM_COMPILER_CHECKED=TRUE \
+  -DSWIFT_STDLIB_BUILD_TYPE=Release \
+  -DSWIFT_BUILD_RUNTIME_WITH_HOST_COMPILER=TRUE \
+  -DBOOTSTRAPPING_MODE=HOSTTOOLS \
+  -DSWIFT_NATIVE_SWIFT_TOOLS_PATH=$NATIVE_SWIFT_BIN \
+  -DSWIFT_NATIVE_CLANG_TOOLS_PATH=/usr/bin \
+  -DSWIFT_NATIVE_LLVM_TOOLS_PATH=$NATIVE_LLVM_BIN \
+  -DLLVM_DIR=$LLVM_WASM_CMAKE \
+  -DSWIFT_PATH_TO_CMARK_SOURCE=/Users/anutosh491/work/swift-dev/cmark \
+  -DSWIFT_PATH_TO_CMARK_BUILD=/Users/anutosh491/work/swift-dev/cmark-wasm-build \
+  -DSWIFT_EMSCRIPTEN_SYSROOT_PATH=$EMSDK_SYSROOT \
   -DSWIFT_INCLUDE_TOOLS=FALSE \
+  -DSWIFT_INCLUDE_DOCS=FALSE \
+  -DSWIFT_INCLUDE_TESTS=FALSE \
+  -DSWIFT_BUILD_REMOTE_MIRROR=FALSE \
+  -DSWIFT_BUILD_SOURCEKIT=FALSE \
+  -DSWIFT_PRIMARY_VARIANT_SDK=EMSCRIPTEN \
+  -DSWIFT_PRIMARY_VARIANT_ARCH=wasm32 \
+  -DSWIFT_SDKS=EMSCRIPTEN \
   -DSWIFT_BUILD_STATIC_STDLIB=TRUE \
   -DSWIFT_BUILD_DYNAMIC_STDLIB=FALSE \
-  -DSWIFT_PRIMARY_VARIANT_SDK=EMSCRIPTEN \
-  -DSWIFT_PRIMARY_VARIANT_ARCH=wasm32
+  -DSWIFT_BUILD_STATIC_SDK_OVERLAY=TRUE \
+  -DSWIFT_STDLIB_INSTALL_ONLY_CLANG_RESOURCE_HEADERS=TRUE \
+  -DSWIFT_STDLIB_STABLE_ABI=TRUE \
+  -DSWIFT_STDLIB_TRACING=FALSE \
+  -DSWIFT_STDLIB_HAS_ASLR=FALSE \
+  -DSWIFT_STDLIB_INSTALL_PARENT_MODULE_FOR_SHIMS=FALSE \
+  -DSWIFT_RUNTIME_CRASH_REPORTER_CLIENT=FALSE \
+  -DSWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY=TRUE \
+  -DSWIFT_ENABLE_DISPATCH=FALSE \
+  -DSWIFT_STDLIB_SUPPORTS_BACKTRACE_REPORTING=FALSE \
+  -DSWIFT_STDLIB_HAS_DLADDR=FALSE \
+  -DSWIFT_STDLIB_COMPACT_ABSOLUTE_FUNCTION_POINTER=TRUE \
+  -DSWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY=TRUE \
+  -DSWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED=TRUE \
+  -DSWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING=TRUE \
+  -DSWIFT_PATH_TO_STRING_PROCESSING_SOURCE=$STRING_PROC_SRC \
+  -DSWIFT_ENABLE_EXPERIMENTAL_CXX_INTEROP=TRUE \
+  -DSWIFT_ENABLE_SYNCHRONIZATION=TRUE \
+  -DSWIFT_ENABLE_VOLATILE=TRUE \
+  -DSWIFT_ENABLE_EXPERIMENTAL_OBSERVATION=TRUE \
+  -DSWIFT_ENABLE_EXPERIMENTAL_DIFFERENTIABLE_PROGRAMMING=TRUE \
+  -DSWIFT_SHOULD_BUILD_EMBEDDED_STDLIB=TRUE \
+  -DSWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING=TRUE \
+  "-DSWIFT_SDK_embedded_ARCH_wasm32_PATH=$EMSDK_SYSROOT" \
+  "-DSWIFT_SDK_embedded_ARCH_wasm32-unknown-emscripten_PATH=$EMSDK_SYSROOT" \
+  -DSWIFT_THREADING_PACKAGE=none \
+  "-DSWIFT_STDLIB_EXTRA_C_COMPILE_FLAGS=-isystem;$EMSDK_SYSROOT/include/compat"
 
-emmake make -j$(sysctl -n hw.logicalcpu) swiftCore
+# Build all stdlib targets — ~30-60 min
+emmake make -j$(sysctl -n hw.logicalcpu)
 ```
 
-This produces:
-- `/lib/swift/emscripten/wasm32/Swift.swiftmodule` — for type-checking
-- `/lib/swift_static/emscripten/wasm32/libswiftCore.a` — for linking the runtime
+**How cmake routes swiftc calls:**
+`emcmake` sets `CMAKE_C_COMPILER=emcc` / `CMAKE_CXX_COMPILER=em++` for C/C++ parts.
+Swift source files are compiled by the native swiftc at `SWIFT_NATIVE_SWIFT_TOOLS_PATH`
+(Phase 5b), which receives `-target wasm32-unknown-emscripten -sysroot $EMSDK_SYSROOT` from
+the cmake infrastructure — it knows how to emit wasm32 objects thanks to Max's patches and
+the WebAssembly backend from Phase 5a.
 
-The `IRGenOptions.RuntimeLibraryPaths` / `SearchPathOpts` in the `CompilerInstance` must
-point at the stdlib build dir for the type-checker to find `Swift.swiftmodule`.
+Verify after build:
+```bash
+# .swiftmodule files — needed for type-checking in the REPL
+ls /Users/anutosh491/work/swift-dev/swift-stdlib-wasm-build/lib/swift/emscripten/wasm32/Swift.swiftmodule
+
+# Static runtime libs — needed for the MAIN_MODULE link
+ls /Users/anutosh491/work/swift-dev/swift-stdlib-wasm-build/lib/swift_static/emscripten/wasm32/libswiftCore.a
+ls /Users/anutosh491/work/swift-dev/swift-stdlib-wasm-build/lib/swift_static/emscripten/wasm32/libswiftConcurrency.a
+```
+
+The `IRGenOptions.RuntimeLibraryPaths` / `SearchPathOpts` in the `CompilerInstance` (Phase 6)
+must include `swift-stdlib-wasm-build/lib/swift` for the type-checker to find
+`Swift.swiftmodule`.
 
 ---
 
