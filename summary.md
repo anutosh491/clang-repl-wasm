@@ -283,7 +283,7 @@ The binaries land at `native_build/bin/llvm-tblgen` and `native_build/bin/clang-
 Set the path:
 
 ```bash
-export NATIVE_LLVM_BIN=/Users/anutosh491/work/swift-dev/llvm-project/native_build/bin
+export NATIVE_LLVM_BIN=/Users/anutosh491/work/swift-dev/llvm-native-full-build/bin
 ```
 
 ---
@@ -594,13 +594,23 @@ actually emit wasm32 object files when cross-compiling stdlib sources. The exist
 `LLVM_TARGETS_TO_BUILD=host` (AArch64 only) — we need to reconfigure it to also include
 `WebAssembly`.
 
-### Phase 5a — Extend native LLVM build to include WebAssembly target
+### Phase 5a — Build a separate native LLVM with WebAssembly backend
+
+The existing `swift-dev/llvm-project/native_build/` was built with `LLVM_TARGETS_TO_BUILD=host`
+(AArch64 only) solely for tablegen tools (`llvm-tblgen`, `clang-tblgen`) needed during Phase 1's
+wasm32 LLVM cross-compile. **Do not touch it** — Phase 1 still references it via
+`LLVM_NATIVE_TOOL_DIR`.
+
+We need a NEW native LLVM build that also includes the **WebAssembly backend compiled into the
+host LLVM static libs**. `LLVMWebAssemblyCodeGen.a` is a macOS ARM64 binary that *implements*
+WebAssembly code generation — the native swiftc (Phase 5b) links against it to emit wasm32
+object files.
 
 ```bash
-cd /Users/anutosh491/work/swift-dev/llvm-project/native_build
+mkdir -p /Users/anutosh491/work/swift-dev/llvm-native-full-build
+cd /Users/anutosh491/work/swift-dev/llvm-native-full-build
 
-# Reconfigure: keep existing settings, add WebAssembly to target list
-cmake ../llvm \
+cmake ../llvm-project/llvm \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=/usr/bin/clang \
   -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
@@ -616,15 +626,15 @@ cmake ../llvm \
   -DLLVM_BUILD_UTILS=OFF \
   -DCLANG_BUILD_TOOLS=OFF
 
-# Build everything (LLVM static libs + clang libs + llvm-ar/ranlib tools)
-# ~30-45 min on M-chip Mac
+# Build LLVM+Clang static libs and llvm-ar/ranlib tools — ~30-45 min on M-chip Mac
 make -j$(sysctl -n hw.logicalcpu)
 ```
 
 Verify:
 ```bash
-ls /Users/anutosh491/work/swift-dev/llvm-project/native_build/lib/libLLVMWebAssemblyCodeGen.a
-ls /Users/anutosh491/work/swift-dev/llvm-project/native_build/bin/llvm-ar
+ls /Users/anutosh491/work/swift-dev/llvm-native-full-build/lib/libLLVMWebAssemblyCodeGen.a
+ls /Users/anutosh491/work/swift-dev/llvm-native-full-build/bin/llvm-ar
+ls /Users/anutosh491/work/swift-dev/llvm-native-full-build/lib/cmake/llvm/LLVMConfig.cmake
 ```
 
 ### Phase 5b — Build native swiftc from swift-dev/swift
@@ -653,18 +663,20 @@ Then configure and build `swift-frontend`:
 mkdir -p /Users/anutosh491/work/swift-dev/swift-native-build
 cd /Users/anutosh491/work/swift-dev/swift-native-build
 
-cmake ../swift \
+cmake -G Ninja ../swift \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=/usr/bin/clang \
   -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
-  -DLLVM_DIR=/Users/anutosh491/work/swift-dev/llvm-project/native_build/lib/cmake/llvm \
-  -DClang_DIR=/Users/anutosh491/work/swift-dev/llvm-project/native_build/lib/cmake/clang \
+  -DCMAKE_Swift_COMPILER=$(xcrun -f swiftc) \
+  -DCMAKE_Swift_COMPILER_WORKS=TRUE \
+  -DLLVM_DIR=/Users/anutosh491/work/swift-dev/llvm-native-full-build/lib/cmake/llvm \
+  -DClang_DIR=/Users/anutosh491/work/swift-dev/llvm-native-full-build/lib/cmake/clang \
   -DSWIFT_PATH_TO_CMARK_SOURCE=/Users/anutosh491/work/swift-dev/cmark \
   -DSWIFT_PATH_TO_CMARK_BUILD=/Users/anutosh491/work/swift-dev/cmark-native-build \
   -DSWIFT_INCLUDE_TOOLS=TRUE \
+  -DSWIFT_BUILD_RUNTIME_WITH_HOST_COMPILER=TRUE \
   -DSWIFT_ENABLE_SWIFT_IN_SWIFT=ON \
   -DBOOTSTRAPPING_MODE=HOSTTOOLS \
-  -DSWIFT_NATIVE_SWIFT_TOOLS_PATH=/usr/bin \
   -DSWIFT_INCLUDE_TESTS=OFF \
   -DSWIFT_INCLUDE_DOCS=OFF \
   -DSWIFT_BUILD_STATIC_STDLIB=OFF \
@@ -678,14 +690,16 @@ cmake ../swift \
   -DSWIFT_EMSCRIPTEN_SYSROOT_PATH=/Users/anutosh491/work/emsdk/upstream/emscripten/cache/sysroot
 
 # Build only swift-frontend — ~30-45 min on M-chip Mac
-make -j$(sysctl -n hw.logicalcpu) swift-frontend
+ninja -j$(sysctl -n hw.logicalcpu) swift-frontend
 ```
 
-**What `BOOTSTRAPPING_MODE=HOSTTOOLS` + `SWIFT_NATIVE_SWIFT_TOOLS_PATH=/usr/bin` means:**
-The cmake uses Xcode's swiftc (`/usr/bin/swiftc`) to compile any Swift-written parts of the
-compiler itself (the "Swift-in-Swift" sources). Those sources are for macOS, so Xcode's
-swiftc works fine. The NATIVE swiftc we're building will contain Max's wasm32 C++ patches
-and the WebAssembly LLVM backend from Phase 5a — making it capable of cross-compiling to
+**What `BOOTSTRAPPING_MODE=HOSTTOOLS` means:**
+cmake uses Xcode's swiftc (`CMAKE_Swift_COMPILER`) to compile any Swift-written parts of the
+compiler itself (the "Swift-in-Swift" sources). `SWIFT_NATIVE_SWIFT_TOOLS_PATH` is intentionally
+NOT set so cmake auto-sets it to `swift-native-build/bin` — this ensures that `swift-compatibility-symbols`
+(built at step ~953) is found in the right place at step ~975, instead of looking for it in Xcode's
+toolchain (which does not ship that tool). The NATIVE swiftc we're building will contain Max's wasm32
+C++ patches and the WebAssembly LLVM backend from Phase 5a — making it capable of cross-compiling to
 wasm32.
 
 Verify:
@@ -695,6 +709,38 @@ ls /Users/anutosh491/work/swift-dev/swift-native-build/bin/swift-frontend
 ls /Users/anutosh491/work/swift-dev/swift-native-build/bin/swiftc
 # If the symlink is missing, create it:
 # ln -sf swift-frontend /Users/anutosh491/work/swift-dev/swift-native-build/bin/swiftc
+```
+
+### Phase 5b.5 — Build `swift-driver` (new driver, macOS host tool)
+
+**Why this is needed:** Max's patches intentionally removed Emscripten support from the *legacy*
+driver (`swiftc` acting as the old driver). The new driver (`swift-driver` package) has
+`EmscriptenToolchain` and handles `wasm32-unknown-emscripten`. The legacy driver's runtime
+lookup checks for `swift-driver` next to `swift-frontend`; if found it exec's into the new
+driver; if not found it falls back to legacy mode → `unknown target` error.
+
+**What to build:** `swift-driver` is a Swift Package (macOS host tool). Build it with Xcode's
+swiftc. Do NOT use the custom `swift-native-build/bin/swiftc` here — that binary targets
+the wasm stdlib build, not a macOS host tool.
+
+**Do NOT delete or rebuild `swift-native-build`.** Just build this package and copy two binaries.
+
+```bash
+cd /Users/anutosh491/work/swift-dev/swift-driver
+
+# Build using Xcode's swiftc (macOS host tool, not wasm)
+# Package.resolved pins exact versions — SwiftPM fetches them automatically
+/usr/bin/swift build -c release
+
+# Drop the new driver binaries next to swift-frontend
+cp .build/release/swift-driver /Users/anutosh491/work/swift-dev/swift-native-build/bin/swift-driver
+cp .build/release/swift-help   /Users/anutosh491/work/swift-dev/swift-native-build/bin/swift-help
+```
+
+Verify the chain works — this must succeed (no "unknown target" error):
+```bash
+/Users/anutosh491/work/swift-dev/swift-native-build/bin/swiftc \
+  -target wasm32-unknown-emscripten -print-target-info 2>&1 | head -5
 ```
 
 ### Phase 5c — Build Swift stdlib for wasm32
@@ -711,11 +757,11 @@ source /Users/anutosh491/work/emsdk/emsdk_env.sh
 
 export EMSDK_SYSROOT=/Users/anutosh491/work/emsdk/upstream/emscripten/cache/sysroot
 export NATIVE_SWIFT_BIN=/Users/anutosh491/work/swift-dev/swift-native-build/bin
-export NATIVE_LLVM_BIN=/Users/anutosh491/work/swift-dev/llvm-project/native_build/bin
+export NATIVE_LLVM_BIN=/Users/anutosh491/work/swift-dev/llvm-native-full-build/bin
 export LLVM_WASM_CMAKE=/Users/anutosh491/work/swift-dev/llvm-wasm-build/lib/cmake/llvm
 export STRING_PROC_SRC=/Users/anutosh491/work/swift-dev/swift-experimental-string-processing
 
-emcmake cmake ../swift \
+emcmake cmake -G Ninja ../swift \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX=/usr \
   -DCMAKE_SYSTEM_NAME=Emscripten \
@@ -729,7 +775,7 @@ emcmake cmake ../swift \
   -DSWIFT_BUILD_RUNTIME_WITH_HOST_COMPILER=TRUE \
   -DBOOTSTRAPPING_MODE=HOSTTOOLS \
   -DSWIFT_NATIVE_SWIFT_TOOLS_PATH=$NATIVE_SWIFT_BIN \
-  -DSWIFT_NATIVE_CLANG_TOOLS_PATH=/usr/bin \
+  -DSWIFT_NATIVE_CLANG_TOOLS_PATH=$NATIVE_LLVM_BIN \
   -DSWIFT_NATIVE_LLVM_TOOLS_PATH=$NATIVE_LLVM_BIN \
   -DLLVM_DIR=$LLVM_WASM_CMAKE \
   -DSWIFT_PATH_TO_CMARK_SOURCE=/Users/anutosh491/work/swift-dev/cmark \
@@ -766,15 +812,15 @@ emcmake cmake ../swift \
   -DSWIFT_ENABLE_VOLATILE=TRUE \
   -DSWIFT_ENABLE_EXPERIMENTAL_OBSERVATION=TRUE \
   -DSWIFT_ENABLE_EXPERIMENTAL_DIFFERENTIABLE_PROGRAMMING=TRUE \
-  -DSWIFT_SHOULD_BUILD_EMBEDDED_STDLIB=TRUE \
-  -DSWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING=TRUE \
-  "-DSWIFT_SDK_embedded_ARCH_wasm32_PATH=$EMSDK_SYSROOT" \
-  "-DSWIFT_SDK_embedded_ARCH_wasm32-unknown-emscripten_PATH=$EMSDK_SYSROOT" \
+  -DSWIFT_SHOULD_BUILD_EMBEDDED_STDLIB=FALSE \
+  -DSWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING=FALSE \
   -DSWIFT_THREADING_PACKAGE=none \
-  "-DSWIFT_STDLIB_EXTRA_C_COMPILE_FLAGS=-isystem;$EMSDK_SYSROOT/include/compat"
+  "-DSWIFT_STDLIB_EXTRA_C_COMPILE_FLAGS=-isystem;$EMSDK_SYSROOT/include/compat" \
+  "-DSWIFT_STDLIB_EXTRA_SWIFT_COMPILE_FLAGS=-no-verify-emitted-module-interface"
 
 # Build all stdlib targets — ~30-60 min
-emmake make -j$(sysctl -n hw.logicalcpu)
+# If already configured (swift-stdlib-wasm-build/ exists), just re-run ninja — no reconfigure needed.
+ninja -j$(sysctl -n hw.logicalcpu)
 ```
 
 **How cmake routes swiftc calls:**
@@ -786,99 +832,415 @@ the WebAssembly backend from Phase 5a.
 
 Verify after build:
 ```bash
-# .swiftmodule files — needed for type-checking in the REPL
-ls /Users/anutosh491/work/swift-dev/swift-stdlib-wasm-build/lib/swift/emscripten/wasm32/Swift.swiftmodule
+# .swiftmodule files — NOT in wasm32/ subdir, they live one level up at emscripten/
+ls /Users/anutosh491/work/swift-dev/swift-stdlib-wasm-build/lib/swift/emscripten/Swift.swiftmodule
+ls /Users/anutosh491/work/swift-dev/swift-stdlib-wasm-build/lib/swift/emscripten/_Concurrency.swiftmodule
 
-# Static runtime libs — needed for the MAIN_MODULE link
+# Static runtime libs — in lib/swift_static/ (not lib/swift/)
 ls /Users/anutosh491/work/swift-dev/swift-stdlib-wasm-build/lib/swift_static/emscripten/wasm32/libswiftCore.a
-ls /Users/anutosh491/work/swift-dev/swift-stdlib-wasm-build/lib/swift_static/emscripten/wasm32/libswiftConcurrency.a
+ls /Users/anutosh491/work/swift-dev/swift-stdlib-wasm-build/lib/swift_static/emscripten/wasm32/libswift_Concurrency.a
 ```
 
-The `IRGenOptions.RuntimeLibraryPaths` / `SearchPathOpts` in the `CompilerInstance` (Phase 6)
-must include `swift-stdlib-wasm-build/lib/swift` for the type-checker to find
-`Swift.swiftmodule`.
+**Artifact layout note:** `.swiftmodule` bundles sit at `lib/swift/emscripten/<Module>.swiftmodule/`
+(architecture-tagged `.swiftmodule` files inside, e.g. `Swift.swiftmodule/wasm32-unknown-emscripten.swiftmodule`).
+Static libs sit at `lib/swift_static/emscripten/wasm32/lib<Module>.a`.
+
+The `SearchPathOpts.RuntimeLibraryPaths` in the `CompilerInstance` (Phase 6) must include
+`swift-stdlib-wasm-build/lib/swift` for the type-checker to find `Swift.swiftmodule`.
 
 ---
 
-### Phase 6 — Write `SwiftCompilerModule.cpp`
+### Phase 6 — `swift-repl-wasm` Project
 
-Analogous to `clang-repl-wasm/CompilerModule.cpp`. Exports to JS:
+Analogous to `clang-repl-wasm`. Project layout:
+
+```
+swift-dev/swift-repl-wasm/
+  SwiftCompilerModule.cpp   ← C++ glue module, exports REPL functions to JS
+  CMakeLists.txt            ← emcmake cmake entry point
+```
+
+---
+
+#### Question 1: What to Preload in the Emscripten Virtual FS
+
+In `clang-repl-wasm`, two things are preloaded:
+1. The emsdk sysroot (`sysroot@/`) — C/C++ system headers for the clang frontend
+2. Clang's resource dir (implicit in the sysroot) — compiler-rt builtins
+
+For `swift-repl-wasm`, the equivalent preloads are:
+
+**1. Swift stdlib `.swiftmodule` files** — the type-checker needs these to resolve `import Swift`.
+The `.swiftmodule` bundles sit at `lib/swift/emscripten/` (not in a `wasm32/` subdir).
+Map the whole `lib/swift` tree into the VFS at `/lib/swift`:
+
+```
+--preload-file /Users/anutosh491/work/swift-dev/swift-stdlib-wasm-build/lib/swift@/lib/swift
+```
+
+This makes `Swift.swiftmodule`, `_Concurrency.swiftmodule`, etc. accessible at
+`/lib/swift/emscripten/Swift.swiftmodule` inside the wasm module. The `CompilerInstance`
+must set `SearchPathOpts.RuntimeLibraryPaths` to `/lib/swift` so the type-checker finds them.
+
+**2. emsdk sysroot** — needed for C interop (`import Glibc`, `import Darwin`, etc.) and for
+Clang's ClangImporter which the Swift type-checker uses to import C modules:
+
+```
+--preload-file /Users/anutosh491/work/emsdk/upstream/emscripten/cache/sysroot@/
+```
+
+This is identical to `clang-repl-wasm`. Maps the entire emscripten sysroot (headers, crt,
+libc++, etc.) to the VFS root `/`.
+
+**Note on clang resource dir:** Clang's own resource headers (compiler-rt, stddef.h, etc.)
+ship inside the emsdk sysroot (`sysroot/lib/clang/<version>/include/`), so preloading the
+sysroot implicitly handles this — no separate preload needed.
+
+---
+
+#### Question 2: What the MAIN_MODULE Links Against
+
+The emcc link step must include all transitive static libs:
+
+**A. Swift compiler libs** (from `swift-wasm-build/lib/`):
+
+```
+libswiftImmediate.a
+libswiftFrontend.a
+libswiftIRGen.a
+libswiftSILGen.a
+libswiftSILOptimizer.a
+libswiftSIL.a
+libswiftSema.a
+libswiftAST.a
+libswiftParse.a
+libswiftClangImporter.a
+libswiftSerialization.a
+libswiftIDE.a
+libswiftBasic.a
+libswiftDemangling.a
+libswiftMarkup.a
+libswiftOption.a
+libswiftSwiftOnoneSupport.a
+```
+
+Plus `swiftCompilerStub` — provides the no-op `initializeSwiftModules()` when
+`SWIFT_ENABLE_SWIFT_IN_SWIFT=OFF`. This is built as an OBJECT library, not included in
+`libswiftImmediate.a`. Link it as an explicit `.o`:
+```
+swift-wasm-build/SwiftCompilerSources/CMakeFiles/swiftCompilerStub.dir/stubs.cpp.o
+```
+
+**B. LLVM+LLD static libs** (from `llvm-wasm-build/lib/`):
+
+```
+-lLLVMSupport -lLLVMCore -lLLVMTargetParser
+-lLLVMAnalysis -lLLVMTarget -lLLVMTransformUtils -lLLVMIRPrinter -lLLVMIRReader
+-lLLVMBitReader -lLLVMBitWriter -lLLVMBitstreamReader
+-lLLVMCoroutines -lLLVMCoverage -lLLVMDebugInfoDWARF
+-lLLVMInstrumentation -lLLVMipo -lLLVMLTO -lLLVMMC -lLLVMMCParser
+-lLLVMObject -lLLVMObjCARCOpts -lLLVMOption -lLLVMProfileData -lLLVMRemarks
+-lLLVMWebAssemblyCodeGen -lLLVMWebAssemblyAsmParser
+-lLLVMWebAssemblyDesc -lLLVMWebAssemblyInfo
+-llldCommon -llldWasm
+-lclangBasic -lclangLex -lclangParse -lclangAST -lclangASTMatchers
+-lclangAnalysis -lclangEdit -lclangRewrite -lclangSerialization
+-lclangFrontend -lclangDriver -lclangCodeGen
+```
+
+`lldWasm` + `lldCommon` enable in-process `wasm-ld` linking per REPL cell (same as
+`clang-repl-wasm`'s use of `WasmIncrementalExecutor`).
+
+**C. Swift runtime** (from `swift-stdlib-wasm-build/lib/swift_static/emscripten/wasm32/`):
+
+```
+libswiftCore.a
+libswift_Concurrency.a
+libswiftDistributed.a
+libswiftObservation.a
+libswiftRegexBuilder.a
+libswift_StringProcessing.a
+libswift_RegexParser.a
+libswiftSynchronization.a
+libswiftEmscriptenLibc.a
+```
+
+These are baked into the MAIN_MODULE so that each cell's SIDE_MODULE can resolve Swift
+runtime symbols (`swift_retain`, `swift_release`, `swift_once`, `_swift_stdlib_*`, etc.)
+at `dlopen()` time without needing separate shared libs.
+
+**D. Other deps** (from `$WASM_PREFIX/lib/`):
+
+```
+libzstd.a   ← Swift uses zstd for serialization (swiftmodule compression)
+libuuid.a   ← Swift runtime UUID support
+libcmark-gfm.a libcmark-gfmExtensions.a  ← Swift frontend Markdown parser
+```
+
+---
+
+#### Question 3: The `autolinkImportedModules` Guard — Remove It
+
+The current `Interpreter.cpp` guards the `autolinkImportedModules()` call with
+`#ifndef __EMSCRIPTEN__`. This was added as a conservative safety measure (native `.dylib`
+paths don't exist in wasm). **This guard should be removed or rethought.**
+
+**Why the guard can be removed:**
+
+`autolinkImportedModules()` calls `dlopen()` on the library paths associated with each
+Swift module imported in the cell. In the wasm browser context:
+
+- Emscripten's `dlopen()` is a real implementation, not a stub. It works correctly in the
+  browser — confirmed by `clang-repl-wasm` which uses `dlopen()` to load each compiled
+  cell as a SIDE_MODULE.
+- We can preload any required `.wasm` side modules into the Emscripten VFS at startup with
+  `--preload-file`. The `dlopen()` call will find them there.
+- If a user does `import MyModule` and `MyModule`'s associated wasm side module is in the
+  VFS (or linked into the MAIN_MODULE), `autolinkImportedModules()` can load it just as
+  well as on macOS.
+
+The only real caveat is that the path the Swift frontend associates with a module must be a
+VFS path (e.g. `/lib/swift/emscripten/`) rather than a macOS absolute path. This is
+controlled by the `SearchPathOpts` and `RuntimeLibraryPaths` set in the `CompilerInvocation`
+— they should point to VFS-preloaded paths like `/lib/swift`.
+
+**Summary:** Remove `#ifndef __EMSCRIPTEN__` from the `autolinkImportedModules()` call.
+The call is safe in wasm as long as the module search paths resolve into the VFS.
+
+---
+
+#### `SwiftCompilerModule.cpp` Skeleton
 
 ```cpp
-extern "C" EMSCRIPTEN_KEEPALIVE int swift_repl_init();
-extern "C" EMSCRIPTEN_KEEPALIVE int swift_repl_parse_and_execute(const char *code);
-extern "C" EMSCRIPTEN_KEEPALIVE int swift_repl_complete(const char *code);
-extern "C" EMSCRIPTEN_KEEPALIVE const char *swift_repl_get_completions();
-```
+#include <emscripten/emscripten.h>
+#include "swift/Immediate/Interpreter.h"
+#include "swift/Frontend/Frontend.h"
+#include "swift/Frontend/FrontendOptions.h"
+#include "swift/Frontend/PrintingDiagnosticConsumer.h"
+#include "swift/AST/DiagnosticEngine.h"
+#include "swift/Basic/SourceManager.h"
+#include "llvm/Support/TargetSelect.h"
+#include <memory>
+#include <mutex>
 
-Inside `swift_repl_init()`:
-1. Configure a `CompilerInvocation` targeting `wasm32-unknown-emscripten`
-2. Set `RuntimeLibraryPaths` to point at the stdlib `.swiftmodule` directory
-3. Create a `CompilerInstance` and call `setupAndRunImmediateFileAction()` or create
-   `swift::Interpreter` directly
-4. The `Interpreter` constructor runs the stdlib warmup (`Void()`)
+static std::unique_ptr<swift::CompilerInstance> s_CI;
+static std::unique_ptr<swift::Interpreter> s_interp;
+static swift::PrintingDiagnosticConsumer s_diagPrinter;
+
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE int swift_repl_init() {
+  static std::once_flag initOnce;
+  std::call_once(initOnce, [] {
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+    llvm::InitializeAllAsmPrinters();
+    llvm::InitializeAllAsmParsers();
+  });
+
+  swift::CompilerInvocation invocation;
+  std::vector<const char *> args = {
+    "swift-repl",
+    "-target", "wasm32-unknown-emscripten",
+    // VFS-preloaded stdlib .swiftmodule files are at /lib/swift/emscripten/
+    "-resource-dir", "/lib/swift",
+    // emsdk sysroot is preloaded at VFS root
+    "-sdk", "/",
+    "-enable-experimental-concurrency",
+  };
+
+  llvm::SmallVector<std::string, 4> errs;
+  swift::DiagnosticEngine diags(*(new swift::SourceManager()));
+  if (invocation.parseArgs(args, diags)) return -1;
+
+  invocation.getFrontendOptions().RequestedAction =
+      swift::FrontendOptions::ActionType::REPL;
+
+  s_CI = std::make_unique<swift::CompilerInstance>();
+  std::string setupError;
+  if (s_CI->setup(invocation, setupError)) return -1;
+  s_CI->addDiagnosticConsumer(&s_diagPrinter);
+
+  // parseStdlib=false — load the prebuilt .swiftmodule instead of parsing source
+  llvm::Error err = llvm::Error::success();
+  s_interp = std::make_unique<swift::Interpreter>(
+      *s_CI,
+      swift::ProcessCmdLine(args.data(), args.data() + args.size()),
+      /*parseStdlib=*/false,
+      err);
+  if (err) return -1;
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int swift_repl_parse_and_execute(const char *code) {
+  if (!s_interp) return -1;
+  llvm::Error err = s_interp->parseAndExecute(code);
+  if (err) {
+    llvm::consumeError(std::move(err));
+    return -1;
+  }
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int swift_repl_is_complete(const char *code) {
+  if (!s_interp) return 1;
+  return s_interp->isInputComplete(code) ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE const char *swift_repl_complete(const char *code) {
+  // TODO: wrap s_interp->complete() results into a null-terminated JSON array
+  return "[]";
+}
+
+} // extern "C"
+```
 
 ---
 
-### Phase 7 — Link everything into `swift-repl.wasm`
+#### `CMakeLists.txt` for `swift-repl-wasm`
 
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(swift-repl-wasm)
+
+set(CMAKE_CXX_STANDARD 17)
+
+# Wasm Swift compiler libs
+set(SWIFT_WASM_BUILD /Users/anutosh491/work/swift-dev/swift-wasm-build)
+# Wasm LLVM+LLD+Clang libs
+set(LLVM_WASM_BUILD /Users/anutosh491/work/swift-dev/llvm-wasm-build)
+# Wasm Swift stdlib static libs
+set(STDLIB_WASM_BUILD /Users/anutosh491/work/swift-dev/swift-stdlib-wasm-build)
+set(WASM_PREFIX /Users/anutosh491/micromamba/envs/swift-wasm)
+set(EMSDK_SYSROOT /Users/anutosh491/work/emsdk/upstream/emscripten/cache/sysroot)
+
+find_package(LLVM REQUIRED CONFIG
+  PATHS ${LLVM_WASM_BUILD}/lib/cmake/llvm NO_DEFAULT_PATH)
+find_package(LLD REQUIRED CONFIG
+  PATHS ${LLVM_WASM_BUILD}/lib/cmake/lld NO_DEFAULT_PATH)
+find_package(Clang REQUIRED CONFIG
+  PATHS ${LLVM_WASM_BUILD}/lib/cmake/clang NO_DEFAULT_PATH)
+
+include_directories(
+  ${LLVM_INCLUDE_DIRS}
+  ${CLANG_INCLUDE_DIRS}
+  ${SWIFT_WASM_BUILD}/include
+)
+
+add_compile_options(-fwasm-exceptions)
+
+add_executable(SwiftRepl SwiftCompilerModule.cpp)
+
+# Swift compiler libs (order matters: leaf libs first for static linking)
+set(SWIFT_LIBS
+  ${SWIFT_WASM_BUILD}/lib/libswiftImmediate.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftIDE.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftFrontend.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftIRGen.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftSILGen.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftSILOptimizer.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftSIL.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftSema.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftAST.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftParse.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftClangImporter.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftSerialization.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftBasic.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftDemangling.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftMarkup.a
+  ${SWIFT_WASM_BUILD}/lib/libswiftOption.a
+  # no-op stub for initializeSwiftModules (SWIFT_ENABLE_SWIFT_IN_SWIFT=OFF):
+  ${SWIFT_WASM_BUILD}/SwiftCompilerSources/CMakeFiles/swiftCompilerStub.dir/stubs.cpp.o
+)
+
+# Swift runtime (baked into MAIN_MODULE — cells resolve against these via dlopen)
+set(SWIFT_RUNTIME_LIBS
+  ${STDLIB_WASM_BUILD}/lib/swift_static/emscripten/wasm32/libswiftCore.a
+  ${STDLIB_WASM_BUILD}/lib/swift_static/emscripten/wasm32/libswift_Concurrency.a
+  ${STDLIB_WASM_BUILD}/lib/swift_static/emscripten/wasm32/libswiftObservation.a
+  ${STDLIB_WASM_BUILD}/lib/swift_static/emscripten/wasm32/libswiftSynchronization.a
+  ${STDLIB_WASM_BUILD}/lib/swift_static/emscripten/wasm32/libswift_StringProcessing.a
+  ${STDLIB_WASM_BUILD}/lib/swift_static/emscripten/wasm32/libswift_RegexParser.a
+  ${STDLIB_WASM_BUILD}/lib/swift_static/emscripten/wasm32/libswiftEmscriptenLibc.a
+)
+
+target_link_libraries(SwiftRepl
+  ${SWIFT_LIBS}
+  ${SWIFT_RUNTIME_LIBS}
+  lldWasm lldCommon
+  LLVMWebAssemblyCodeGen LLVMWebAssemblyAsmParser LLVMWebAssemblyDesc LLVMWebAssemblyInfo
+  LLVMipo LLVMLinker LLVMIRPrinter LLVMIRReader LLVMBitWriter LLVMBitReader
+  LLVMBitstreamReader LLVMCoroutines LLVMCoverage LLVMDebugInfoDWARF
+  LLVMInstrumentation LLVMLTO LLVMObjCARCOpts LLVMProfileData LLVMRemarks
+  LLVMMCParser LLVMMC LLVMObject LLVMTarget LLVMTransformUtils
+  LLVMAnalysis LLVMCore LLVMOption LLVMTargetParser LLVMSupport
+  clangCodeGen clangFrontend clangDriver clangSerialization clangRewrite
+  clangEdit clangAnalysis clangASTMatchers clangAST clangParse clangLex clangBasic
+  ${WASM_PREFIX}/lib/libzstd.a
+  ${WASM_PREFIX}/lib/libuuid.a
+  ${WASM_PREFIX}/lib/libcmark-gfm.a
+  ${WASM_PREFIX}/lib/libcmark-gfmExtensions.a
+  embind
+)
+
+target_link_options(SwiftRepl PUBLIC
+  "SHELL:-O1"
+  "SHELL:-fwasm-exceptions"
+  "SHELL:-sMODULARIZE=1"
+  "SHELL:-sEXPORT_ES6=1"
+  "SHELL:-sASSERTIONS=0"
+  "SHELL:-sALLOW_MEMORY_GROWTH=1"
+  "SHELL:-sINITIAL_MEMORY=256MB"
+  "SHELL:-sTOTAL_STACK=32MB"
+  "SHELL:-sMAIN_MODULE=1"
+  "SHELL:-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,stringToNewUTF8,FS"
+  "SHELL:-sEXPORTED_FUNCTIONS=_malloc,_free,_swift_repl_init,_swift_repl_parse_and_execute,_swift_repl_is_complete,_swift_repl_complete"
+  # Preload Swift .swiftmodule files → type-checker finds them at /lib/swift/emscripten/
+  "SHELL:--preload-file=${STDLIB_WASM_BUILD}/lib/swift@/lib/swift"
+  # Preload emsdk sysroot → C interop headers, Clang resource headers
+  "SHELL:--preload-file=${EMSDK_SYSROOT}@/"
+)
+
+set_target_properties(SwiftRepl PROPERTIES OUTPUT_NAME "SwiftRepl")
+```
+
+Build command:
 ```bash
-emcc \
-  SwiftCompilerModule.cpp \
-  -sMAIN_MODULE=1 \
-  -sDYNAMIC_EXECUTION=1 \
-  -sALLOW_MEMORY_GROWTH=1 \
-  -sINITIAL_MEMORY=256MB \
-  -sEXPORTED_RUNTIME_METHODS='["FS","callMain"]' \
-  # All the .a libs from swift-wasm-build/lib/:
-  libswiftImmediate.a libswiftFrontend.a libswiftIRGen.a libswiftSILGen.a \
-  libswiftSILOptimizer.a libswiftSIL.a libswiftSema.a libswiftAST.a \
-  libswiftParse.a libswiftClangImporter.a libswiftSerialization.a \
-  libswiftBasic.a libswiftDemangling.a ... \
-  # swiftCompilerStub (provides no-op initializeSwiftModules):
-  SwiftCompilerSources/CMakeFiles/swiftCompilerStub.dir/stubs.cpp.o \
-  # Swift runtime:
-  libswiftCore.a libswiftConcurrency.a ... \
-  # LLVM static libs from llvm-wasm-build:
-  -L/Users/anutosh491/work/swift-dev/llvm-wasm-build/lib \
-  -lLLVMCore -lLLVMSupport -lLLVMWebAssemblyCodeGen ... \
-  # lld for wasm-ld-in-process:
-  -llldWasm -llldCommon \
-  # Other deps:
-  $WASM_PREFIX/lib/libzstd.a $WASM_PREFIX/lib/libuuid.a \
-  -o swift-repl.js
-
-# Preload the stdlib .swiftmodule files into the virtual FS
-# (so the type-checker can find them at /lib/swift/emscripten/wasm32/):
-# Add to emcc: --preload-file <stdlib-wasm-build>/lib/swift@/lib/swift
+cd /Users/anutosh491/work/swift-dev/swift-repl-wasm
+mkdir -p build && cd build
+emcmake cmake -DCMAKE_BUILD_TYPE=Release ..
+emmake make -j$(sysctl -n hw.logicalcpu)
 ```
 
-The `--preload-file` flag bakes the stdlib `.swiftmodule` files into the wasm binary's
-virtual filesystem — exactly analogous to how Emscripten preloads data files for native
-apps.
+Output: `SwiftRepl.js`, `SwiftRepl.wasm`, `SwiftRepl.data`
 
 ---
 
-### The Full Runtime Picture
+### Phase 7 — The Full Runtime Picture
 
 ```
-Browser                     swift-repl.wasm (MAIN_MODULE)
-  │                              │
-  │  JS: Module._swift_repl_init()    │
-  │──────────────────────────────>│
-  │                              │  type-check warmup: reads Swift.swiftmodule
-  │                              │  from Emscripten virtual FS (/lib/swift/...)
-  │                              │
+Browser                          SwiftRepl.wasm (MAIN_MODULE)
+  │                                    │
+  │  JS: Module._swift_repl_init()     │
+  │───────────────────────────────────>│
+  │                                    │  reads Swift.swiftmodule from VFS
+  │                                    │  at /lib/swift/emscripten/
+  │                                    │  type-checks stdlib warmup
+  │                                    │
   │  JS: Module._swift_repl_parse_and_execute("print(\"hello\")")
-  │──────────────────────────────>│
-  │                              │  typeCheck → SIL → IRGen → emit __repl_0.o
-  │                              │  wasm-ld: __repl_0.o → __repl_0.wasm (SIDE_MODULE)
-  │                              │  dlopen(__repl_0.wasm) resolves swift_retain etc.
-  │                              │  dlsym("$s__repl_0...") → call()
-  │                              │  stdout: "hello"
-  │<──────────────────────────────│
+  │───────────────────────────────────>│
+  │                                    │  typeCheck → SIL → IRGen → __repl_0.o
+  │                                    │  wasm-ld (lldWasm in-process):
+  │                                    │    __repl_0.o → __repl_0.wasm (SIDE_MODULE)
+  │                                    │    --allow-undefined (Swift runtime)
+  │                                    │  dlopen(__repl_0.wasm)
+  │                                    │    resolves swift_retain, swift_release,
+  │                                    │    _swift_stdlib_*, print() etc. from MAIN_MODULE
+  │                                    │  dlsym("$s__repl_0AA...") → call()
+  │                                    │  stdout: "hello"
+  │<───────────────────────────────────│
 ```
 
-**Key insight:** The MAIN_MODULE bakes in the Swift runtime (`libswiftCore.a`). Each cell's
-side module imports Swift runtime symbols from it. `dlopen` stitches them together at
-runtime using Emscripten's dynamic linking — no JIT needed.
+**Key insight:** The MAIN_MODULE bakes in `libswiftCore.a` and all Swift runtime libs.
+Each cell's SIDE_MODULE imports those symbols at `dlopen()` time using Emscripten's wasm
+dynamic linking — no JIT required.
